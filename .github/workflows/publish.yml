@@ -1,0 +1,265 @@
+name: publish
+
+on:
+  push:
+    branches:
+      - main
+  # Kept alongside the push trigger so a failed publish can be retried without an empty
+  # commit, and so a publish can be made deliberately.
+  workflow_dispatch:
+
+# A newer commit on main should win the race for `latest` rather than queue behind an older
+# one that would overwrite it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Publishing `latest` unconditionally means a broken commit becomes the image everyone
+  # pulls. The tests take seconds; the gate is worth it.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: "1.27"
+          cache: true
+
+      - name: Check formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "gofmt needed on:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./... -count=1
+
+  publish:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Required to push to GHCR with the built-in token.
+      packages: write
+
+    outputs:
+      version: ${{ steps.sha.outputs.short }}
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+
+      # Only needed for the final alpine stage's apk step, which is the one thing that runs
+      # on the target architecture. The Go build is pinned to $BUILDPLATFORM and
+      # cross-compiles, so nothing expensive happens under emulation.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Sign in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          # No secret to configure: the automatic token can write packages for this repo.
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Short SHA
+        id: sha
+        run: echo "short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/${{ github.repository }}:latest
+          build-args: |
+            VERSION=${{ steps.sha.outputs.short }}
+          platforms: linux/amd64,linux/arm64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # Keeps the package listing to one real platform instead of adding an
+          # "unknown/unknown" attestation entry beside it.
+          provenance: false
+
+      # Steps on this job rather than a job of their own, so they reuse the checkout and the
+      # GHCR login above — a fresh package is private, and a separate job would fail to pull
+      # its own image.
+      #
+      # traefik/whoami is the target: it echoes the request it received as plain text, which
+      # turns every header rule in docs/proxying.md into a grep.
+      - name: Smoke-test the image
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}:latest
+        run: |
+          set -euo pipefail
+
+          docker run --rm "$IMAGE" version
+
+          # A container with no volume must refuse to start. This is the one behaviour that
+          # cannot be tested any other way — it exists because the Dockerfile deliberately
+          # does not declare VOLUME /data — and it is exactly the failure that would
+          # otherwise ship looking like a working release, with the tokens living in a layer
+          # that disappears with the container.
+          if docker run --rm "$IMAGE" serve 2>/tmp/nomount; then
+            echo "proxio started with no /data mounted"; exit 1
+          fi
+          grep -q "mount a volume" /tmp/nomount
+
+          docker network create smoke-net
+          docker run -d --name whoami --network smoke-net traefik/whoami:latest
+          # Two proxios, each with its own volume and its own token, so the chain below
+          # proves that neither hop needs to know the other's credential.
+          docker run -d --name proxio   --network smoke-net -v smoke-a:/data -p 8080:80 "$IMAGE"
+          docker run -d --name proxio-b --network smoke-net -v smoke-b:/data "$IMAGE"
+
+          for _ in $(seq 30); do
+            if curl -fsS http://127.0.0.1:8080/healthz >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8080/healthz | grep -q '"ok":true'
+
+          # An instance with no tokens says so, loudly, rather than refusing every request in
+          # silence.
+          docker logs proxio 2>&1 | grep -q "no tokens exist"
+
+          A=$(docker exec proxio   proxio token create smoke)
+          B=$(docker exec proxio-b proxio token create smoke)
+          case "$A" in
+            px_*) ;;
+            *) echo "token create printed something other than a token: $A"; exit 1 ;;
+          esac
+          # The running server has to see a token minted by a second process, with no restart.
+          docker exec proxio proxio token list | grep -q smoke
+
+          enc() { printf %s "$1" | jq -sRr @uri; }
+          WHOAMI='http://whoami/'
+          BASE="http://127.0.0.1:8080/proxy?url=$(enc "$WHOAMI")"
+          code() { curl -s -o /dev/null -w '%{http_code}' "$@"; }
+
+          [ "$(code "$BASE")" = 401 ]
+          [ "$(code "$BASE&token=px_wrong")" = 401 ]
+          [ "$(code "$BASE&token=$A")" = 200 ]
+          # Repeating a parameter is refused rather than resolved: for token, "first wins" and
+          # "last wins" are two different access decisions from the same URL.
+          [ "$(code "$BASE&token=$A&token=px_wrong")" = 400 ]
+
+          # proxio's own parameters must not show up on the other side.
+          echoed=$(curl -fsS "$BASE&token=$A")
+          if printf '%s' "$echoed" | grep -qiE 'X-Proxio-|token='; then
+            echo "something of proxio's reached the target"; printf '%s\n' "$echoed"; exit 1
+          fi
+          printf '%s' "$echoed" | grep -q 'X-Forwarded-For'
+          printf '%s' "$echoed" | grep -q 'Via: 1.1 proxio'
+
+          # hide strips an inbound chain rather than merely not adding one — the case a "do
+          # not add" implementation gets wrong, where the address goes out in the header it
+          # arrived in.
+          hidden=$(curl -fsS -H 'X-Forwarded-For: 203.0.113.9' -H 'Via: 1.1 someone' \
+            "$BASE&token=$A&hide=1")
+          if printf '%s' "$hidden" | grep -qiE '^(X-Forwarded|X-Real-Ip|Via):'; then
+            echo "hide=1 leaked the caller"; printf '%s\n' "$hidden"; exit 1
+          fi
+
+          # A typo must fail loudly, and so must a bare flag: under a truthy-only check each
+          # is a 200 with forwarding quietly still on.
+          [ "$(code "$BASE&token=$A&hide=ture")" = 400 ]
+          [ "$(code "$BASE&token=$A&hide=")" = 400 ]
+
+          # Chaining, which is what the parameters are for. The outer proxio's target is the
+          # inner proxio's own /proxy URL, carrying the inner one's token.
+          inner="http://proxio-b/proxy?token=$B&url=$(enc "$WHOAMI")"
+          chained=$(curl -fsS "http://127.0.0.1:8080/proxy?token=$A&url=$(enc "$inner")")
+          vias=$(printf '%s' "$chained" | grep -c 'Via: 1.1 proxio' || true)
+          if [ "$vias" != 2 ]; then
+            echo "expected one Via per hop, got $vias"; printf '%s\n' "$chained"; exit 1
+          fi
+          printf '%s' "$chained" | grep 'X-Forwarded-For' | grep -q ','
+
+          # And neither token is anywhere in either proxio's log. The target URL of the outer
+          # hop *is* a /proxy URL with a token on it, which is the whole reason the query
+          # string never reaches the log.
+          for c in proxio proxio-b; do
+            for tok in "$A" "$B"; do
+              if docker logs "$c" 2>&1 | grep -q "$tok"; then
+                echo "a token is in $c's log"; exit 1
+              fi
+            done
+            if docker logs "$c" 2>&1 | grep -q 'token='; then
+              echo "a query string reached $c's log"; exit 1
+            fi
+          done
+          docker logs proxio 2>&1 | grep -q '{redacted}'
+
+          # A real https target, which is the assertion that ca-certificates made it into the
+          # runtime image. Without it every https:// URL fails verification and proxio
+          # proxies nothing but plaintext.
+          [ "$(code "http://127.0.0.1:8080/proxy?token=$A&url=$(enc 'https://example.com/')")" = 200 ]
+
+          # And a withdrawn token stops working, again with no restart.
+          docker exec proxio proxio token delete smoke
+          [ "$(code "$BASE&token=$A")" = 401 ]
+
+          docker rm -f proxio proxio-b whoami >/dev/null
+          docker network rm smoke-net >/dev/null
+
+  # A job of its own rather than steps on `publish`, because a failing `test` *skips*
+  # `publish` rather than failing it, and a step in a job that never starts cannot report
+  # that it never started. This one runs either way and reads the results off `needs`.
+  notify:
+    needs:
+      - test
+      - publish
+    # Not always(): cancel-in-progress means a newer push kills the run in flight, and being
+    # told that a commit you just superseded was cancelled is noise.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    permissions: {}
+
+    # The secrets context is not available to `if`, so the presence check goes through env.
+    # Without this, a repo that has not set the secrets yet gets a red run on every push — a
+    # broken notifier should not look like a broken build.
+    env:
+      TELEGRAM_TO: ${{ secrets.TELEGRAM_TO }}
+      TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+
+    steps:
+      - name: Notify Telegram on success
+        if: ${{ env.TELEGRAM_TOKEN != '' && env.TELEGRAM_TO != '' && needs.publish.result == 'success' }}
+        uses: appleboy/telegram-action@v1.0.1
+        with:
+          to: ${{ env.TELEGRAM_TO }}
+          token: ${{ env.TELEGRAM_TOKEN }}
+          format: markdown
+          disable_web_page_preview: true
+          message: |
+            🔔 *${{ github.repository }}* published `ghcr.io/${{ github.repository }}:latest`
+
+            version `${{ needs.publish.outputs.version }}` — [${{ github.sha }}](https://github.com/${{ github.repository }}/commit/${{ github.sha }}) by ${{ github.actor }}
+
+      - name: Notify Telegram on failure
+        if: ${{ env.TELEGRAM_TOKEN != '' && env.TELEGRAM_TO != '' && needs.publish.result != 'success' }}
+        uses: appleboy/telegram-action@v1.0.1
+        with:
+          to: ${{ env.TELEGRAM_TO }}
+          token: ${{ env.TELEGRAM_TOKEN }}
+          format: markdown
+          disable_web_page_preview: true
+          # Which half broke is the first thing worth knowing: a failing test means the
+          # commit is bad, a failing publish means the commit is fine and the build is not.
+          message: |
+            ❌ *${{ github.repository }}* ${{ needs.test.result != 'success' && 'tests failed' || 'publish failed' }}
+
+            [${{ github.sha }}](https://github.com/${{ github.repository }}/commit/${{ github.sha }}) by ${{ github.actor }}
+            [View run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
