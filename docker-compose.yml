@@ -1,0 +1,64 @@
+# A working deployment behind caddy-docker-proxy. Read "Read this before deploying" in the
+# README first — a token is proxio's whole security boundary.
+
+services:
+  proxio:
+    image: ghcr.io/reeywhaar/proxio:latest
+    restart: unless-stopped
+
+    environment:
+      # Every setting proxio has, commented out at its default. One file to read, rather
+      # than a compose file pointing at an env file that holds the explanations.
+      #
+      # The log level is left uncommented on purpose: compose rejects an `environment:` key
+      # whose entries are all commented out, because that parses as an empty mapping rather
+      # than as no settings. One live line keeps the block valid to uncomment into.
+
+      # debug, info, warn, error. One JSON line per proxied request on stdout.
+      PROXIO_LOG_LEVEL: info
+
+      # Where tokens.json lives. Must match the mount below.
+      #PROXIO_DATA_DIR: /data
+
+      # TCP connect and TLS handshake to the target.
+      #PROXIO_DIAL_TIMEOUT: 10s
+
+      # How long a target has to *begin* answering. Not a cap on the response: a proxied
+      # body may take an hour and nothing here will cut it off.
+      #PROXIO_RESPONSE_TIMEOUT: 30s
+
+      # How many 3xx hops proxio follows on the caller's behalf. Set it to 0 and a redirect
+      # passes through untouched, with its Location intact, for the caller to deal with.
+      #PROXIO_MAX_REDIRECTS: 10
+
+    volumes:
+      # Required. proxio refuses to start without it, because the alternative is tokens in a
+      # directory that disappears with the container.
+      - data:/data
+
+    healthcheck:
+      test: ["CMD", "proxio", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+    # Nothing is published to the host; the proxy reaches it over this network.
+    #
+    # Worth a thought rather than a copy: anything else on this network is reachable by
+    # anyone holding a token. That is proxio working as designed, and it is the reason to
+    # keep the network small.
+    networks:
+      - caddy
+
+    labels:
+      caddy: proxio.example.com
+      caddy.reverse_proxy: "{{upstreams 80}}"
+      caddy.log.output: stdout
+      caddy.log.format: json
+
+volumes:
+  data:
+
+networks:
+  caddy:
+    external: true
